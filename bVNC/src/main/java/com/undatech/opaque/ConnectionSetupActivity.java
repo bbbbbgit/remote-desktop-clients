@@ -86,7 +86,7 @@ public class ConnectionSetupActivity extends Activity {
             }
         });
         
-        // Define what happens when one taps the Connect button.
+        // Define what happens when one taps the Save button.
         saveButton = (Button) findViewById(R.id.saveButton);
         saveButton.setOnClickListener(new OnClickListener () {
             @Override
@@ -94,13 +94,10 @@ public class ConnectionSetupActivity extends Activity {
                 String u = user.getText().toString();
                 String h = hostname.getText().toString();
                 
-                // Only if a username and a hostname were entered, save the connection and try to connect.
+                // Only if a username and a hostname were entered, save the connection.
                 if (!(u.equals("") || h.equals(""))) {
                     saveSelectedPreferences(true);
                     finish();
-                    //Intent intent = new Intent(ConnectionSetupActivity.this, RemoteCanvasActivity.class);
-                    //intent.putExtra("com.undatech.opaque.ConnectionSettings", currentConnection);
-                    //startActivity(intent);
                 // Otherwise, let the user know that at least a user and hostname are required.
                 } else {
                     Toast toast = Toast.makeText(appContext, R.string.error_no_user_hostname, Toast.LENGTH_LONG);

@@ -30,13 +30,17 @@
 
 package com.iiordanov.bVNC;
 
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Timer;
 
 import android.annotation.SuppressLint;
@@ -84,7 +88,9 @@ import com.iiordanov.bVNC.dialogs.GetTextFragment;
 import com.iiordanov.bVNC.exceptions.AnonCipherUnsupportedException;
 import com.undatech.opaque.ConnectionSettings;
 import com.undatech.opaque.MessageDialogs;
+import com.undatech.opaque.OpaqueHandler;
 import com.undatech.opaque.RdpCommunicator;
+import com.undatech.opaque.RemoteClientLibConstants;
 import com.undatech.opaque.RfbConnectable;
 import com.undatech.opaque.Viewable;
 import com.undatech.opaque.SpiceCommunicator;
@@ -112,7 +118,7 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
     private RfbProto rfb = null;
     private RdpCommunicator rdpcomm = null;
     public SpiceCommunicator spicecomm = null;
-    private Socket sock = null;
+    Map<String, String> vmNameToId = new HashMap<String, String>();
 
     public boolean maintainConnection = true;
 
@@ -178,6 +184,12 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
      * This flag indicates whether this is the SPICE client.
      */
     boolean isSpice = false;
+
+    /*
+     * This flag indicates whether this is the Opaque client.
+     */
+    boolean isOpaque = false;
+
     public boolean spiceUpdateReceived = false;
 
     /*
@@ -199,6 +211,7 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
         isVnc = getContext().getPackageName().toUpperCase().contains("VNC");
         isRdp = getContext().getPackageName().toUpperCase().contains("RDP");
         isSpice = getContext().getPackageName().toUpperCase().contains("SPICE");
+        isOpaque = getContext().getPackageName().toUpperCase().contains("OPAQUE");
 
         final Display display = ((Activity) context).getWindow().getWindowManager().getDefaultDisplay();
         displayWidth = display.getWidth();
@@ -212,24 +225,43 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
                 android.os.Build.MANUFACTURER.contains("BlackBerry")) {
             bb = true;
         }
+
+        // Startup the connection thread with a progress dialog
+        pd = ProgressDialog.show(getContext(), getContext().getString(R.string.info_progress_dialog_connecting),
+                getContext().getString(R.string.info_progress_dialog_establishing),
+                true, true, new DialogInterface.OnCancelListener() {
+                    @Override
+                    public void onCancel(DialogInterface dialog) {
+                        closeConnection();
+                        handler.post(new Runnable() {
+                            public void run() {
+                                Utils.showFatalErrorMessage(getContext(), getContext().getString(R.string.info_progress_dialog_aborted));
+                            }
+                        });
+                    }
+                });
+
+        // Make this dialog cancellable only upon hitting the Back button and not touching outside.
+        pd.setCanceledOnTouchOutside(false);
     }
 
-    /*
-    RemotePointer init(final ConnectionSettings settings, final RemoteCanvasActivityHandler handler) {
+    RemotePointer init(final ConnectionSettings settings, final Handler handler, final Runnable setModes) {
         this.settings = settings;
         this.handler = handler;
+        this.setModes = setModes;
         checkNetworkConnectivity();
         initializeClipboardMonitor();
-        spicecomm = new SpiceCommunicator (getContext(), handler, this, settings.isRequestingNewDisplayResolution(), settings.isUsbEnabled());
+        spicecomm = new SpiceCommunicator(getContext(), handler, this, settings.isRequestingNewDisplayResolution(), settings.isUsbEnabled());
+        rfbconn = spicecomm;
         pointer = new RemoteSpicePointer(spicecomm, this, handler);
         try {
             keyboard = new RemoteSpiceKeyboard(getResources(), spicecomm, this, handler, settings.getLayoutMap());
         } catch (Throwable e) {
             handleUncaughtException(e);
         }
+        maintainConnection = true;
         return pointer;
     }
-    */
 
     /**
      * Checks whether the device has networking and quits with an error if it doesn't.
@@ -324,6 +356,7 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
      * @param setModes Callback to run on UI thread after connection is set up
      */
     RemotePointer initializeCanvas(ConnectionBean bean, Database db, final Runnable setModes) {
+        maintainConnection = true;
         this.setModes = setModes;
         connection = bean;
         database = db;
@@ -336,24 +369,6 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
         }
 
         sshTunneled = (connection.getConnectionType() == Constants.CONN_TYPE_SSH);
-
-        // Startup the connection thread with a progress dialog
-        pd = ProgressDialog.show(getContext(), getContext().getString(R.string.info_progress_dialog_connecting),
-                getContext().getString(R.string.info_progress_dialog_establishing),
-                true, true, new DialogInterface.OnCancelListener() {
-                    @Override
-                    public void onCancel(DialogInterface dialog) {
-                        closeConnection();
-                        handler.post(new Runnable() {
-                            public void run() {
-                                Utils.showFatalErrorMessage(getContext(), getContext().getString(R.string.info_progress_dialog_aborted));
-                            }
-                        });
-                    }
-                });
-
-        // Make this dialog cancellable only upon hitting the Back button and not touching outside.
-        pd.setCanceledOnTouchOutside(false);
 
         try {
             if (isSpice) {
@@ -615,6 +630,90 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
         rfb.processProtocol();
     }
 
+    /**
+     * Initialize the canvas to show the remote desktop
+     */
+    void startOpaque() {
+        if (!pd.isShowing())
+            pd.show();
+
+        Thread cThread = new Thread () {
+            @Override
+            public void run() {
+                try {
+                    // Obtain user's password if necessary.
+                    if (settings.getPassword().equals("")) {
+                        android.util.Log.i (TAG, "Displaying a dialog to obtain user's password.");
+                        handler.sendEmptyMessage(RemoteClientLibConstants.GET_PASSWORD);
+                        synchronized(spicecomm) {
+                            spicecomm.wait();
+                        }
+                    }
+
+                    String ovirtCaFile = null;
+                    if (settings.isUsingCustomOvirtCa()) {
+                        ovirtCaFile = settings.getOvirtCaFile();
+                    } else {
+                        String caBundleFileName = new File(getContext().getFilesDir(), "ssl/certs/ca-certificates.crt").getPath();
+                        ovirtCaFile = caBundleFileName;
+                    }
+
+                    // If not VM name is specified, then get a list of VMs and let the user pick one.
+                    if (settings.getVmname().equals("")) {
+                        int success = spicecomm.fetchOvirtVmNames(settings.getHostname(), settings.getUser(),
+                                settings.getPassword(), ovirtCaFile,
+                                settings.isSslStrict());
+                        // VM retrieval was unsuccessful we do not continue.
+                        ArrayList<String> vmNames = spicecomm.getVmNames();
+                        if (success != 0 || vmNames.isEmpty()) {
+                            return;
+                        } else {
+                            // If there is just one VM, pick it and skip the dialog.
+                            if (vmNames.size() == 1) {
+                                settings.setVmname(vmNames.get(0));
+                                settings.saveToSharedPreferences(getContext());
+                            } else {
+                                while (settings.getVmname().equals("")) {
+                                    android.util.Log.i (TAG, "Displaying a dialog with VMs to the user.");
+                                    // Populate the data structure that is used to convert VM names to IDs.
+                                    for (String s : vmNames) {
+                                        vmNameToId.put(s, s);
+                                    }
+                                    handler.sendMessage(OpaqueHandler.getMessageStringList(RemoteClientLibConstants.DIALOG_DISPLAY_VMS,
+                                            "vms", vmNames));
+                                    synchronized(spicecomm) {
+                                        spicecomm.wait();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    spicecomm.setHandler(handler);
+                    spicecomm.connectOvirt(settings.getHostname(),
+                            settings.getVmname(),
+                            settings.getUser(),
+                            settings.getPassword(),
+                            ovirtCaFile,
+                            settings.isAudioPlaybackEnabled(), settings.isSslStrict());
+
+                    try {
+                        synchronized(spicecomm) {
+                            spicecomm.wait(35000);
+                        }
+                    } catch (InterruptedException e) {}
+
+                    if (!spiceUpdateReceived && maintainConnection) {
+                        handler.sendEmptyMessage(RemoteClientLibConstants.OVIRT_TIMEOUT);
+                    }
+
+                } catch (Throwable e) {
+                    handleUncaughtException(e);
+                }
+            }
+        };
+        cThread.start();
+    }
+
 
     /**
      * Sends over the unix username and password if this is VNC over SSH connectio and automatic sending of
@@ -809,7 +908,7 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
 
         capacity = BCFactory.getInstance().getBCActivityManager().getMemoryClass(Utils.getActivityManager(getContext()));
 
-        if (connection.getForceFull() == BitmapImplHint.AUTO) {
+        if (connection != null && connection.getForceFull() == BitmapImplHint.AUTO) {
             if (fbsize * CompactBitmapData.CAPACITY_MULTIPLIER <= capacity * 1024 * 1024) {
                 useFull = true;
                 compact = true;
@@ -819,11 +918,11 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
                 useFull = false;
             }
         } else {
-            useFull = (connection.getForceFull() == BitmapImplHint.FULL);
+            useFull = (connection != null && connection.getForceFull() == BitmapImplHint.FULL);
         }
 
         if (!isVnc) {
-            myDrawable = new UltraCompactBitmapData(rfbconn, this, isSpice);
+            myDrawable = new UltraCompactBitmapData(rfbconn, this, isSpice|isOpaque);
             android.util.Log.i(TAG, "Using UltraCompactBufferBitmapData.");
         } else if (!useFull) {
             myDrawable = new LargeBitmapData(rfbconn, this, dx, dy, capacity);
@@ -836,7 +935,7 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
                     myDrawable = new FullBufferBitmapData(rfbconn, this, capacity);
                     android.util.Log.i(TAG, "Using FullBufferBitmapData.");
                 } else {
-                    myDrawable = new CompactBitmapData(rfbconn, this, isSpice);
+                    myDrawable = new CompactBitmapData(rfbconn, this, isSpice|isOpaque);
                     android.util.Log.i(TAG, "Using CompactBufferBitmapData.");
                 }
             } catch (Throwable e) { // If despite our efforts we fail to allocate memory, use LBBM.
@@ -849,7 +948,8 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
         }
 
         try {
-            if (isRdp || connection.getUseLocalCursor() == Constants.CURSOR_FORCE_LOCAL) {
+            if (isRdp || isOpaque ||
+                    connection != null && connection.getUseLocalCursor() == Constants.CURSOR_FORCE_LOCAL) {
                 initializeSoftCursor();
             }
             handler.post(drawableSetter);
@@ -1240,8 +1340,13 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
      */
     private Runnable drawableSetter = new Runnable() {
         public void run() {
-            if (myDrawable != null)
+            android.util.Log.d(TAG, "drawableSetter.run");
+            if (myDrawable != null) {
+                android.util.Log.d(TAG, "drawableSetter myDrawable not null");
                 myDrawable.setImageDrawable(RemoteCanvas.this);
+            } else {
+                android.util.Log.e(TAG, "drawableSetter myDrawable is null");
+            }
         }
     };
 
@@ -1350,7 +1455,13 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
 
     @Override
     public void mouseMode(boolean relative) {
-        if (relative && !connection.getInputMode().equals(InputHandlerTouchpad.ID)) {
+        String inputMode = "";
+        if (settings != null) {
+            inputMode = settings.getInputMethod();
+        } else if (connection != null) {
+            inputMode = connection.getInputMode();
+        }
+        if (relative && !inputMode.equals(InputHandlerTouchpad.ID)) {
             showMessage(getContext().getString(R.string.info_set_touchpad_input_mode));
         } else {
             this.pointer.setRelativeEvents(relative);
@@ -1481,7 +1592,11 @@ public class RemoteCanvas extends android.support.v7.widget.AppCompatImageView i
     }
 
     public boolean getMouseFollowPan() {
-        return connection.getFollowPan();
+        boolean res = true;
+        if (connection != null) {
+            res = connection.getFollowPan();
+        }
+        return res;
     }
 
     public int getAbsX() {

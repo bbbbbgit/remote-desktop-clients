@@ -23,6 +23,10 @@
 //
 package com.iiordanov.bVNC;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.URL;
+import java.net.URLConnection;
 import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,11 +48,13 @@ import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.os.Vibrator;
+import android.support.v4.app.FragmentManager;
 import android.support.v7.app.ActionBar;
 import android.support.v7.app.AppCompatActivity;
 import android.support.v7.widget.Toolbar;
@@ -91,12 +97,15 @@ import com.iiordanov.bVNC.input.InputHandlerTouchpad;
 import com.iiordanov.bVNC.input.Panner;
 import com.iiordanov.bVNC.input.RemoteKeyboard;
 import com.iiordanov.bVNC.input.RemotePointer;
-import com.iiordanov.bVNC.dialogs.GetTextFragment;
-import com.iiordanov.bVNC.dialogs.SelectTextElementFragment;
+import com.undatech.opaque.dialogs.GetTextFragment;
+import com.undatech.opaque.dialogs.SelectTextElementFragment;
+import com.undatech.opaque.ConnectionSettings;
+import com.undatech.opaque.MessageDialogs;
+import com.undatech.opaque.OpaqueHandler;
 import com.undatech.opaque.RemoteClientLibConstants;
-import com.undatech.opaque.util.GeneralUtils;
+import com.undatech.opaque.util.FileUtils;
 import com.undatech.opaque.util.OnTouchViewMover;
-import com.undatech.remoteClientUi.*;
+import com.undatech.remoteClientUi.R;
 
 public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyListener,
                                                                         SelectTextElementFragment.OnFragmentDismissedListener,
@@ -115,6 +124,7 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
     private MenuItem[] scalingModeMenuItems;
     private InputHandler inputModeHandlers[];
     private ConnectionBean connection;
+    private ConnectionSettings connectionSettings;
     static final int[] inputModeIds = { R.id.itemInputTouchpad,
                                                 R.id.itemInputTouchPanZoomMouse,
                                                 R.id.itemInputDragPanZoomMouse,
@@ -228,30 +238,24 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
     @Override
     public void onCreate(Bundle icicle) {
         super.onCreate(icicle);
-        Utils.showMenu(this);
-        initialize();
-        if (connection != null && connection.isReadyForConnection())
-        	continueConnecting();
-    }
+        // TODO: Implement left-icon
+        //requestWindowFeature(Window.FEATURE_LEFT_ICON);
+        //setFeatureDrawableResource(Window.FEATURE_LEFT_ICON, R.drawable.icon);
 
-    @SuppressLint("SourceLockedOrientationActivity")
-    void initialize () {
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                             WindowManager.LayoutParams.FLAG_FULLSCREEN);
+
+        Utils.showMenu(this);
+
+        setContentView(R.layout.canvas);
+
+        canvas = (RemoteCanvas) findViewById(R.id.canvas);
+
         if (android.os.Build.VERSION.SDK_INT >= 9) {
             android.os.StrictMode.ThreadPolicy policy = new android.os.StrictMode.ThreadPolicy.Builder().permitAll().build();
             android.os.StrictMode.setThreadPolicy(policy);
         }
-        
-        handler = new Handler ();
-        
-        requestWindowFeature(Window.FEATURE_NO_TITLE);
-        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN,
-                             WindowManager.LayoutParams.FLAG_FULLSCREEN);
-        
-        if (Utils.querySharedPreferenceBoolean(this, Constants.keepScreenOnTag))
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        
-        if (Utils.querySharedPreferenceBoolean(this, Constants.forceLandscapeTag))
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
 
         View decorView = getWindow().getDecorView();
         decorView.setOnSystemUiVisibilityChangeListener
@@ -266,6 +270,36 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
                         //handler.postDelayed(rotationCorrector, 300);
                     }
                 });
+
+        Runnable setModes = new Runnable() {
+            public void run() {
+                try {
+                    setModes();
+                } catch (NullPointerException e) {
+                }
+            }};
+
+        if (!canvas.isOpaque) {
+            initialize(setModes);
+            if (connection != null && connection.isReadyForConnection()) {
+                continueConnecting();
+            }
+        } else {
+            initializeOpaque(setModes);
+            if (connectionSettings != null)
+                continueConnecting();
+        }
+    }
+
+    @SuppressLint("SourceLockedOrientationActivity")
+    void initialize (final Runnable setModes) {
+        handler = new Handler ();
+
+        if (Utils.querySharedPreferenceBoolean(this, Constants.keepScreenOnTag))
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        
+        if (Utils.querySharedPreferenceBoolean(this, Constants.forceLandscapeTag))
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
 
         database = ((App)getApplication()).getDatabase();
         
@@ -341,25 +375,49 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
             if (connection.getSshPort() == 0)
                 connection.setSshPort(Constants.DEFAULT_SSH_PORT);
         }
+        pointer = canvas.initializeCanvas(connection, database, setModes);
+    }
+
+    @SuppressLint("SourceLockedOrientationActivity")
+    private void initializeOpaque(final Runnable setModes) {
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
+        Intent i = getIntent();
+        String vvFileName = retrieveVvFileFromIntent(i);
+        if (vvFileName == null) {
+            android.util.Log.d(TAG, "Initializing session from connection settings.");
+            connectionSettings = (ConnectionSettings)i.getSerializableExtra("com.undatech.opaque.ConnectionSettings");
+            handler = new OpaqueHandler(this, canvas, connectionSettings);
+            pointer = canvas.init(connectionSettings, handler, setModes);
+
+            if (connectionSettings.getConnectionType().equals(getResources().getString(R.string.connection_type_pve))) {
+                // TODO: Implement
+                android.util.Log.e(TAG, "would canvas.startPve()");
+                //canvas.startPve();
+            } else {
+                canvas.startOpaque();
+            }
+        } else {
+            android.util.Log.d(TAG, "Initializing session from vv file: " + vvFileName);
+            File f = new File(vvFileName);
+            if (!f.exists()) {
+                // Quit with an error if the file does not exist.
+                MessageDialogs.displayMessageAndFinish(this, R.string.vv_file_not_found, R.string.error_dialog_title);
+                return;
+            }
+            connectionSettings = new ConnectionSettings(RemoteClientLibConstants.DEFAULT_SETTINGS_FILE);
+            connectionSettings.loadFromSharedPreferences(getApplicationContext());
+            handler = new OpaqueHandler(this, canvas, connectionSettings);
+            pointer = canvas.init(connectionSettings, handler, setModes);
+            // TODO: Implement
+            android.util.Log.e(TAG, "would canvas.startFromVvFile(vvFileName)");
+            //canvas.startFromVvFile(vvFileName);
+        }
     }
 
     void continueConnecting () {
-        // TODO: Implement left-icon
-        //requestWindowFeature(Window.FEATURE_LEFT_ICON);
-        //setFeatureDrawableResource(Window.FEATURE_LEFT_ICON, R.drawable.icon); 
-
-        setContentView(R.layout.canvas);
-        canvas = (RemoteCanvas) findViewById(R.id.vnc_canvas);
-
         // Initialize and define actions for on-screen keys.
         initializeOnScreenKeys ();
-    
-        pointer = canvas.initializeCanvas(connection, database, new Runnable() {
-            public void run() {
-                try { setModes(); } catch (NullPointerException e) { }
-            }
-        });
-        
+
         canvas.setOnKeyListener(this);
         canvas.setFocusableInTouchMode(true);
         canvas.setDrawingCacheEnabled(false);
@@ -468,7 +526,95 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
         showToolbar();
     }
 
-    
+    /**
+     * Retrieves a vv file from the intent if possible and returns the path to it.
+     * @param i
+     * @return the vv file name or NULL if no file was discovered.
+     */
+    private String retrieveVvFileFromIntent(Intent i) {
+        final Uri data = i.getData();
+        String vvFileName = null;
+        final String tempVvFile = getFilesDir() + "/tempfile.vv";
+        int msgId = 0;
+
+        android.util.Log.d(TAG, "Got intent: " + i.toString());
+
+        if (data != null) {
+            android.util.Log.d(TAG, "Got data: " + data.toString());
+            final String dataString = data.toString();
+            if (dataString.startsWith("http")) {
+                android.util.Log.d(TAG, "Intent is with http scheme.");
+                msgId = R.string.error_failed_to_download_vv_http;
+                FileUtils.deleteFile(tempVvFile);
+
+                // Spin up a thread to grab the file over the network.
+                Thread t = new Thread () {
+                    @Override
+                    public void run () {
+                        try {
+                            // Download the file and write it out.
+                            URL url = new URL (data.toString());
+                            File file = new File(tempVvFile);
+
+                            URLConnection ucon = url.openConnection();
+                            FileUtils.outputToFile(ucon.getInputStream(), new File(tempVvFile));
+
+                            synchronized(RemoteCanvasActivity.this) {
+                                RemoteCanvasActivity.this.notify();
+                            }
+                        } catch (IOException e) {
+                            int what = RemoteClientLibConstants.VV_OVER_HTTP_FAILURE;
+                            if (dataString.startsWith("https")) {
+                                what = RemoteClientLibConstants.VV_OVER_HTTPS_FAILURE;
+                            }
+                            // Quit with an error we could not download the .vv file.
+                            handler.sendEmptyMessage(what);
+                        }
+                    }
+                };
+                t.start();
+
+                synchronized (this) {
+                    try {
+                        this.wait(RemoteClientLibConstants.VV_GET_FILE_TIMEOUT);
+                    } catch (InterruptedException e) {
+                        vvFileName = null;
+                        e.printStackTrace();
+                    }
+                    vvFileName = tempVvFile;
+                }
+            } else if (dataString.startsWith("file")) {
+                android.util.Log.d(TAG, "Intent is with file scheme.");
+                msgId = R.string.error_failed_to_obtain_vv_file;
+                vvFileName = data.getPath();
+            } else if (dataString.startsWith("content")) {
+                android.util.Log.d(TAG, "Intent is with content scheme.");
+                msgId = R.string.error_failed_to_obtain_vv_content;
+                FileUtils.deleteFile(tempVvFile);
+
+                try {
+                    FileUtils.outputToFile(getContentResolver().openInputStream(data), new File(tempVvFile));
+                    vvFileName = tempVvFile;
+                } catch (IOException e) {
+                    android.util.Log.e(TAG, "Could not write temp file: IOException.");
+                    e.printStackTrace();
+                } catch (SecurityException e) {
+                    android.util.Log.e(TAG, "Could not write temp file: SecurityException.");
+                    e.printStackTrace();
+                }
+            }
+
+            // Check if we were successful in obtaining a file and put up an error dialog if not.
+            if (dataString.startsWith("http") || dataString.startsWith("file") || dataString.startsWith("content")) {
+                if (vvFileName == null)
+                    MessageDialogs.displayMessageAndFinish(this, msgId, R.string.error_dialog_title);
+            }
+            android.util.Log.d(TAG, "Got filename: " + vvFileName);
+        }
+
+        return vvFileName;
+    }
+
     @SuppressWarnings("deprecation")
     private void setKeyStowDrawableAndVisibility() {
         Drawable replacer = null;
@@ -484,7 +630,8 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
             keyStow.setBackground(replacer);
         }
 
-        if (connection.getExtraKeysToggleType() == Constants.EXTRA_KEYS_OFF)
+        // TODO: Implement for Opaque client
+        if (connection != null && connection.getExtraKeysToggleType() == Constants.EXTRA_KEYS_OFF)
             keyStow.setVisibility(View.GONE);
         else
             keyStow.setVisibility(View.VISIBLE);
@@ -1012,7 +1159,8 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
             updateScalingMenu();
             
             // Set the text of the Extra Keys menu item appropriately.
-            if (connection.getExtraKeysToggleType() == Constants.EXTRA_KEYS_ON)
+            // TODO: Implement for Opaque
+            if (connection != null && connection.getExtraKeysToggleType() == Constants.EXTRA_KEYS_ON)
                 menu.findItem(R.id.itemExtraKeys).setTitle(R.string.extra_keys_disable);
             else
                 menu.findItem(R.id.itemExtraKeys).setTitle(R.string.extra_keys_enable);
@@ -1429,13 +1577,33 @@ public class RemoteCanvasActivity extends AppCompatActivity implements OnKeyList
     }
 
     @Override
-    public void onTextObtained(String obtainedString, boolean dialogCancelled) {
-        // TODO: Implement
+    public void onTextObtained(String id, String obtainedString) {
+        android.util.Log.i(TAG, "onTextObtained called with id: " + id);
+        canvas.pd.show();
+
+        if (id.equals(RemoteClientLibConstants.GET_PASSWORD_ID)) {
+            connectionSettings.setPassword(obtainedString);
+        } else if (id.equals(RemoteClientLibConstants.GET_OTP_CODE_ID)) {
+            connectionSettings.setOtpCode(obtainedString);
+        }
+
+        synchronized (canvas.spicecomm) {
+            canvas.spicecomm.notify();
+        }
+
+        FragmentManager fm = this.getSupportFragmentManager();
+        fm.beginTransaction().remove(fm.findFragmentByTag(id)).commit();
     }
 
     @Override
     public void onTextSelected(String selectedString) {
-        // TODO: Implement
+        android.util.Log.i(TAG, "onTextSelected called with selectedString: " + selectedString);
+        canvas.pd.show();
+        connectionSettings.setVmname(canvas.vmNameToId.get(selectedString));
+        connectionSettings.saveToSharedPreferences(this);
+        synchronized (canvas.spicecomm) {
+            canvas.spicecomm.notify();
+        }
     }
 
     private class ToolbarHiderRunnable implements Runnable {
